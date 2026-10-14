@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from types import ModuleType
 from unittest.mock import DEFAULT, MagicMock, patch
 
+import pytest
 from packaging.version import parse as parse_version
 from parameterized import parameterized
 
@@ -419,3 +420,31 @@ def test_availability_helpers_are_compile_safe(helper_name: str, args: tuple):
         return x + 1 if helper(*args) else x - 1
 
     run(torch.zeros(3))  # a graph break inside the helper would raise here
+
+
+@require_torch
+def test_torch_compilable_check_compiles_with_fullgraph():
+    """
+    A data-dependent check, like the placeholder count of multimodal models' `get_placeholder_mask`, compiles with
+    `fullgraph=True` and still raises on a mismatch, eagerly and compiled.
+    """
+    import torch
+
+    from transformers.utils.import_utils import torch_compilable_check
+
+    def scatter(embeds, input_ids, features):
+        mask = (input_ids == 9).unsqueeze(-1)
+        torch_compilable_check(mask.sum() * embeds.shape[-1] == features.numel(), "placeholder count mismatch")
+        return embeds.masked_scatter(mask, features)
+
+    embeds, input_ids = torch.randn(2, 5, 8), torch.tensor([[1, 9, 9, 2, 9], [9, 3, 9, 9, 4]])
+    features = torch.randn(2, 3, 8)
+    torch.compiler.reset()
+    compiled = torch.compile(scatter, fullgraph=True)
+    torch.testing.assert_close(compiled(embeds, input_ids, features), scatter(embeds, input_ids, features))
+
+    with pytest.raises(ValueError, match="placeholder count mismatch"):
+        scatter(embeds, input_ids, features[:, :2])
+    torch.compiler.reset()
+    with pytest.raises(RuntimeError):
+        torch.compile(scatter, fullgraph=True)(embeds, input_ids, features[:, :2])
